@@ -6,12 +6,18 @@ import logging
 import signal
 from typing import Any, Dict, List, Optional
 
-from aiokafka import AIOKafkaConsumer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.errors import KafkaError
 
 from a2a.server.request_handlers.kafka_handler import KafkaHandler, KafkaMessage
 from a2a.server.request_handlers.request_handler import RequestHandler
 from a2a.utils.errors import ServerError
+from a2a.types import (
+    Message,
+    Task,
+    TaskStatusUpdateEvent,
+    TaskArtifactUpdateEvent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +49,7 @@ class KafkaServerApp:
         self.kafka_config = kafka_config
         
         self.consumer: Optional[AIOKafkaConsumer] = None
+        self.producer: Optional[AIOKafkaProducer] = None
         self.handler: Optional[KafkaHandler] = None
         self._running = False
         self._consumer_task: Optional[asyncio.Task[None]] = None
@@ -53,13 +60,19 @@ class KafkaServerApp:
             return
 
         try:
-            # Initialize Kafka handler
+            # Initialize protocol handler (Kafka-agnostic) and pass self as response sender
             self.handler = KafkaHandler(
                 self.request_handler,
-                bootstrap_servers=self.bootstrap_servers,
-                **self.kafka_config
+                response_sender=self,
             )
-            await self.handler.start()
+
+            # Initialize producer
+            self.producer = AIOKafkaProducer(
+                bootstrap_servers=self.bootstrap_servers,
+                value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+                **self.kafka_config,
+            )
+            await self.producer.start()
 
             # Initialize consumer
             self.consumer = AIOKafkaConsumer(
@@ -95,11 +108,11 @@ class KafkaServerApp:
             except asyncio.CancelledError:
                 pass
 
-        # Stop consumer and handler
+        # Stop consumer and producer
         if self.consumer:
             await self.consumer.stop()
-        if self.handler:
-            await self.handler.stop()
+        if self.producer:
+            await self.producer.stop()
 
         logger.info("Kafka server stopped")
 
@@ -172,6 +185,82 @@ class KafkaServerApp:
         except Exception as e:
             logger.error(f"Unexpected error in request consumer: {e}")
 
+    # ResponseSender implementation
+    async def send_response(
+        self,
+        reply_topic: str,
+        correlation_id: str,
+        result: Any,
+        response_type: str,
+    ) -> None:
+        if not self.producer:
+            logger.error("Producer not available")
+            return
+        try:
+            response_data = {
+                "type": response_type,
+                "data": result.model_dump() if hasattr(result, 'model_dump') else result,
+            }
+            headers = [
+                ("correlation_id", correlation_id.encode("utf-8")),
+            ]
+            await self.producer.send_and_wait(
+                reply_topic,
+                value=response_data,
+                headers=headers,
+            )
+        except Exception as e:
+            logger.error(f"Failed to send response: {e}")
+
+    async def send_stream_complete(
+        self,
+        reply_topic: str,
+        correlation_id: str,
+    ) -> None:
+        if not self.producer:
+            logger.error("Producer not available")
+            return
+        try:
+            response_data = {
+                "type": "stream_complete",
+                "data": {},
+            }
+            headers = [
+                ("correlation_id", correlation_id.encode("utf-8")),
+            ]
+            await self.producer.send_and_wait(
+                reply_topic,
+                value=response_data,
+                headers=headers,
+            )
+        except Exception as e:
+            logger.error(f"Failed to send stream completion signal: {e}")
+
+    async def send_error_response(
+        self,
+        reply_topic: str,
+        correlation_id: str,
+        error_message: str,
+    ) -> None:
+        if not self.producer:
+            logger.error("Producer not available")
+            return
+        try:
+            response_data = {
+                "type": "error",
+                "data": {"error": error_message},
+            }
+            headers = [
+                ("correlation_id", correlation_id.encode("utf-8")),
+            ]
+            await self.producer.send_and_wait(
+                reply_topic,
+                value=response_data,
+                headers=headers,
+            )
+        except Exception as e:
+            logger.error(f"Failed to send error response: {e}")
+
     async def get_handler(self) -> KafkaHandler:
         """Get the Kafka handler instance.
         
@@ -184,16 +273,37 @@ class KafkaServerApp:
     async def send_push_notification(
         self,
         reply_topic: str,
-        notification: Any,
+        notification: Message | Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent,
     ) -> None:
-        """Send a push notification to a specific client topic.
-        
-        Args:
-            reply_topic: The client's reply topic.
-            notification: The notification to send.
-        """
-        handler = await self.get_handler()
-        await handler.send_push_notification(reply_topic, notification)
+        """Send a push notification to a specific client topic."""
+        if not self.producer:
+            logger.error("Producer not available for push notification")
+            return
+        try:
+            if isinstance(notification, Task):
+                response_type = "task"
+            elif isinstance(notification, TaskStatusUpdateEvent):
+                response_type = "task_status_update"
+            elif isinstance(notification, TaskArtifactUpdateEvent):
+                response_type = "task_artifact_update"
+            else:
+                response_type = "message"
+
+            response_data = {
+                "type": f"push_{response_type}",
+                "data": notification.model_dump() if hasattr(notification, 'model_dump') else notification,
+            }
+            headers = [
+                ("notification_type", b"push"),
+            ]
+            await self.producer.send_and_wait(
+                reply_topic,
+                value=response_data,
+                headers=headers,
+            )
+            logger.debug(f"Sent push notification to {reply_topic}")
+        except Exception as e:
+            logger.error(f"Failed to send push notification: {e}")
 
     async def __aenter__(self):
         """Async context manager entry."""

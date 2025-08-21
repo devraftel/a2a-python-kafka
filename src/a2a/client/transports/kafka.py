@@ -74,6 +74,7 @@ class KafkaClientTransport(ClientTransport):
         self.correlation_manager = CorrelationManager()
         self._consumer_task: Optional[asyncio.Task[None]] = None
         self._running = False
+        self._auto_start = False
 
     def _sanitize_topic_name(self, name: str) -> str:
         """Sanitize a name to be valid for Kafka topic names.
@@ -103,7 +104,11 @@ class KafkaClientTransport(ClientTransport):
         return sanitized
 
     async def start(self) -> None:
-        """Start the Kafka client transport."""
+        """Start the Kafka client transport.
+        
+        This method is called internally by the client factory and should not be
+        exposed to end users. It initializes the Kafka producer and consumer.
+        """
         if self._running:
             return
 
@@ -146,7 +151,11 @@ class KafkaClientTransport(ClientTransport):
             raise A2AClientError(f"Failed to start Kafka client transport: {e}") from e
 
     async def stop(self) -> None:
-        """Stop the Kafka client transport."""
+        """Stop the Kafka client transport.
+        
+        This method is called internally by the close() method and should not be
+        exposed to end users. It cleans up the Kafka producer and consumer.
+        """
         if not self._running:
             return
 
@@ -170,6 +179,11 @@ class KafkaClientTransport(ClientTransport):
             await self.consumer.stop()
 
         logger.info(f"Kafka client transport stopped for agent {self.agent_card.name}")
+
+    async def _ensure_started(self) -> None:
+        """Ensure the transport is started, auto-starting if needed."""
+        if not self._running and self._auto_start:
+            await self.start()
 
     async def _consume_responses(self) -> None:
         """Consume responses from the reply topic."""
@@ -242,6 +256,8 @@ class KafkaClientTransport(ClientTransport):
         streaming: bool = False,
     ) -> str:
         """Send a request and return the correlation ID."""
+        await self._ensure_started()
+        
         if not self.producer or not self._running:
             raise A2AClientError("Kafka client transport not started")
 
@@ -284,6 +300,7 @@ class KafkaClientTransport(ClientTransport):
         context: ClientCallContext | None = None,
     ) -> Task | Message:
         """Send a non-streaming message request to the agent."""
+        await self._ensure_started()
         correlation_id = await self._send_request('message_send', request, context, streaming=False)
         
         # Register and wait for response
@@ -311,6 +328,7 @@ class KafkaClientTransport(ClientTransport):
         context: ClientCallContext | None = None,
     ) -> AsyncGenerator[Message | Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent]:
         """Send a streaming message request to the agent and yield responses as they arrive."""
+        await self._ensure_started()
         correlation_id = await self._send_request('message_send', request, context, streaming=True)
         
         # Register streaming request
@@ -514,7 +532,11 @@ class KafkaClientTransport(ClientTransport):
         return self.agent_card
 
     async def close(self) -> None:
-        """Close the transport."""
+        """Close the transport.
+        
+        This method stops the Kafka client transport and cleans up all resources.
+        It's the public interface for shutting down the transport.
+        """
         await self.stop()
 
     async def __aenter__(self):
