@@ -493,10 +493,24 @@ class KafkaClientTransport(ClientTransport):
         context: ClientCallContext | None = None,
     ) -> TaskPushNotificationConfig:
         """Set task push notification configuration."""
-        # For Kafka, we can store the callback configuration locally
-        # and use it when we receive push notifications
-        # This is a simplified implementation
-        return request
+        correlation_id = await self._send_request('task_push_notification_config_set', request, context)
+        future = await self.correlation_manager.register(correlation_id)
+        
+        try:
+            timeout = 30.0
+            if context and context.timeout:
+                timeout = context.timeout
+                
+            result = await asyncio.wait_for(future, timeout=timeout)
+            if isinstance(result, TaskPushNotificationConfig):
+                return result
+            raise A2AClientError(f"Expected TaskPushNotificationConfig, got {type(result)}")
+        except asyncio.TimeoutError:
+            await self.correlation_manager.complete_with_exception(
+                correlation_id,
+                A2AClientError(f"Set task callback request timed out after {timeout} seconds")
+            )
+            raise A2AClientError(f"Set task callback request timed out after {timeout} seconds")
 
     async def get_task_callback(
         self,
@@ -505,7 +519,10 @@ class KafkaClientTransport(ClientTransport):
         context: ClientCallContext | None = None,
     ) -> TaskPushNotificationConfig:
         """Get task push notification configuration."""
-        return await self.get_task_push_notification_config(request, context=context)
+        result = await self.get_task_push_notification_config(request, context=context)
+        if result is None:
+            raise A2AClientError(f"No task callback configuration found for task {request.task_id}")
+        return result
 
     async def resubscribe(
         self,
@@ -514,12 +531,44 @@ class KafkaClientTransport(ClientTransport):
         context: ClientCallContext | None = None,
     ) -> AsyncGenerator[Task | Message | TaskStatusUpdateEvent | TaskArtifactUpdateEvent]:
         """Reconnect to get task updates."""
-        # For Kafka, resubscription is handled automatically by the consumer
-        # This method can be used to request task updates
-        task_request = TaskQueryParams(task_id=request.task_id)
-        task = await self.get_task(task_request, context=context)
-        if task:
-            yield task
+        # For Kafka, we send a resubscribe request to get streaming updates
+        correlation_id = await self._send_request('task_resubscribe', request, context, streaming=True)
+        
+        # Register streaming request
+        streaming_future = await self.correlation_manager.register_streaming(correlation_id)
+        
+        try:
+            timeout = 30.0
+            if context and context.timeout:
+                timeout = context.timeout
+            
+            # First, get the current task state
+            task_request = TaskQueryParams(task_id=request.task_id)
+            try:
+                task = await self.get_task(task_request, context=context)
+                yield task
+            except Exception as e:
+                logger.warning(f"Failed to get initial task state: {e}")
+            
+            # Then yield streaming updates as they arrive
+            while not streaming_future.is_done():
+                try:
+                    # Wait for next response with timeout
+                    result = await asyncio.wait_for(streaming_future.get(), timeout=5.0)
+                    yield result
+                except asyncio.TimeoutError:
+                    # Check if stream is done or if we've exceeded total timeout
+                    if streaming_future.is_done():
+                        break
+                    # Continue waiting for more responses
+                    continue
+                    
+        except Exception as e:
+            await self.correlation_manager.complete_with_exception(
+                correlation_id,
+                A2AClientError(f"Resubscribe request failed: {e}")
+            )
+            raise A2AClientError(f"Resubscribe request failed: {e}") from e
 
     async def get_card(
         self,

@@ -155,8 +155,8 @@ class TestKafkaClientTransport:
         mock_producer_class.return_value = mock_producer
         mock_consumer_class.return_value = mock_consumer
         
-        # Start transport using internal method
-        await kafka_transport._start()
+        # Start transport
+        await kafka_transport.start()
         
         assert kafka_transport._running is True
         assert kafka_transport.producer == mock_producer
@@ -167,8 +167,8 @@ class TestKafkaClientTransport:
         mock_producer.start.assert_called_once()
         mock_consumer.start.assert_called_once()
         
-        # Stop transport using internal method
-        await kafka_transport._stop()
+        # Stop transport
+        await kafka_transport.stop()
         
         assert kafka_transport._running is False
         mock_producer.stop.assert_called_once()
@@ -279,8 +279,8 @@ class TestKafkaClientTransport:
     @pytest.mark.asyncio
     async def test_context_manager(self, kafka_transport):
         """Test async context manager."""
-        with patch.object(kafka_transport, '_start') as mock_start, \
-             patch.object(kafka_transport, '_stop') as mock_stop:
+        with patch.object(kafka_transport, 'start') as mock_start, \
+             patch.object(kafka_transport, 'stop') as mock_stop:
             
             async with kafka_transport:
                 mock_start.assert_called_once()
@@ -426,7 +426,6 @@ class TestKafkaClientTransport:
                 interceptors=[]
             )
 
-
 @pytest.mark.integration
 class TestKafkaIntegration:
     """Integration tests for Kafka transport (requires running Kafka)."""
@@ -441,8 +440,8 @@ class TestKafkaIntegration:
         )
         
         try:
-            await transport._start()
+            await transport.start()
             assert transport._running is True
         finally:
-            await transport._stop()
+            await transport.stop()
             assert transport._running is False

@@ -188,6 +188,11 @@ class KafkaHandler:
                 result = await self.request_handler.on_list_task_push_notification_config(request, context)
                 response_type = "task_push_notification_config_list"
 
+            elif method == "task_push_notification_config_set":
+                request = TaskPushNotificationConfig.model_validate(params)
+                result = await self.request_handler.on_set_task_push_notification_config(request, context)
+                response_type = "task_push_notification_config"
+
             elif method == "task_push_notification_config_delete":
                 request = DeleteTaskPushNotificationConfigParams.model_validate(params)
                 await self.request_handler.on_delete_task_push_notification_config(request, context)
@@ -219,6 +224,25 @@ class KafkaHandler:
                 
                 # Handle streaming response
                 async for event in self.request_handler.on_message_send_stream(request, context):
+                    if isinstance(event, TaskStatusUpdateEvent):
+                        response_type = "task_status_update"
+                    elif isinstance(event, TaskArtifactUpdateEvent):
+                        response_type = "task_artifact_update"
+                    elif isinstance(event, Task):
+                        response_type = "task"
+                    else:
+                        response_type = "message"
+                    
+                    await self.response_sender.send_response(reply_topic, correlation_id, event, response_type)
+                
+                # Send stream completion signal
+                await self.response_sender.send_stream_complete(reply_topic, correlation_id)
+
+            elif method == "task_resubscribe":
+                request = TaskIdParams.model_validate(params)
+                
+                # Handle streaming resubscription
+                async for event in self.request_handler.on_resubscribe_to_task(request, context):
                     if isinstance(event, TaskStatusUpdateEvent):
                         response_type = "task_status_update"
                     elif isinstance(event, TaskArtifactUpdateEvent):
