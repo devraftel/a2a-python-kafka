@@ -36,6 +36,7 @@ from a2a.types import (
     MessageSendParams,
     Task,
     TaskIdParams,
+    TaskNotCancelableError,
     TaskNotFoundError,
     TaskPushNotificationConfig,
     TaskQueryParams,
@@ -111,6 +112,26 @@ class DefaultRequestHandler(RequestHandler):
         task: Task | None = await self.task_store.get(params.id)
         if not task:
             raise ServerError(error=TaskNotFoundError())
+
+        # Apply historyLength parameter if specified
+        if params.history_length is not None and task.history:
+            # Limit history to the most recent N messages
+            limited_history = (
+                task.history[-params.history_length :]
+                if params.history_length > 0
+                else []
+            )
+            # Create a new task instance with limited history
+            task = Task(
+                id=task.id,
+                context_id=task.context_id,
+                status=task.status,
+                artifacts=task.artifacts,
+                history=limited_history,
+                metadata=task.metadata,
+                kind=task.kind,
+            )
+
         return task
 
     async def on_cancel_task(
@@ -123,6 +144,14 @@ class DefaultRequestHandler(RequestHandler):
         task: Task | None = await self.task_store.get(params.id)
         if not task:
             raise ServerError(error=TaskNotFoundError())
+
+        # Check if task is in a non-cancelable state (completed, canceled, failed, rejected)
+        if task.status.state in TERMINAL_TASK_STATES:
+            raise ServerError(
+                error=TaskNotCancelableError(
+                    message=f'Task cannot be canceled - current state: {task.status.state}'
+                )
+            )
 
         task_manager = TaskManager(
             task_id=task.id,
@@ -195,7 +224,7 @@ class DefaultRequestHandler(RequestHandler):
             if task.status.state in TERMINAL_TASK_STATES:
                 raise ServerError(
                     error=InvalidParamsError(
-                        message=f'Task {task.id} is in terminal state: {task.status.state}'
+                        message=f'Task {task.id} is in terminal state: {task.status.state.value}'
                     )
                 )
 
@@ -244,7 +273,9 @@ class DefaultRequestHandler(RequestHandler):
         """Validates that agent-generated task ID matches the expected task ID."""
         if task_id != event_task_id:
             logger.error(
-                f'Agent generated task_id={event_task_id} does not match the RequestContext task_id={task_id}.'
+                'Agent generated task_id=%s does not match the RequestContext task_id=%s.',
+                event_task_id,
+                task_id,
             )
             raise ServerError(
                 InternalError(message='Task ID mismatch in agent response')
@@ -286,14 +317,22 @@ class DefaultRequestHandler(RequestHandler):
 
         interrupted_or_non_blocking = False
         try:
+            # Create async callback for push notifications
+            async def push_notification_callback() -> None:
+                await self._send_push_notification_if_needed(
+                    task_id, result_aggregator
+                )
+
             (
                 result,
                 interrupted_or_non_blocking,
             ) = await result_aggregator.consume_and_break_on_interrupt(
-                consumer, blocking=blocking
+                consumer,
+                blocking=blocking,
+                event_callback=push_notification_callback,
             )
             if not result:
-                raise ServerError(error=InternalError())
+                raise ServerError(error=InternalError())  # noqa: TRY301
 
             if isinstance(result, Task):
                 self._validate_task_id_match(task_id, result.id)
@@ -302,8 +341,8 @@ class DefaultRequestHandler(RequestHandler):
                 task_id, result_aggregator
             )
 
-        except Exception as e:
-            logger.error(f'Agent execution failed. Error: {e}')
+        except Exception:
+            logger.exception('Agent execution failed')
             raise
         finally:
             if interrupted_or_non_blocking:
@@ -437,7 +476,7 @@ class DefaultRequestHandler(RequestHandler):
         if task.status.state in TERMINAL_TASK_STATES:
             raise ServerError(
                 error=InvalidParamsError(
-                    message=f'Task {task.id} is in terminal state: {task.status.state}'
+                    message=f'Task {task.id} is in terminal state: {task.status.state.value}'
                 )
             )
 
@@ -478,16 +517,12 @@ class DefaultRequestHandler(RequestHandler):
             params.id
         )
 
-        task_push_notification_config = []
-        if push_notification_config_list:
-            for config in push_notification_config_list:
-                task_push_notification_config.append(
-                    TaskPushNotificationConfig(
-                        task_id=params.id, push_notification_config=config
-                    )
-                )
-
-        return task_push_notification_config
+        return [
+            TaskPushNotificationConfig(
+                task_id=params.id, push_notification_config=config
+            )
+            for config in push_notification_config_list
+        ]
 
     async def on_delete_task_push_notification_config(
         self,

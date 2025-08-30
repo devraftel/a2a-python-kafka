@@ -46,14 +46,7 @@ class ToProto:
     ) -> struct_pb2.Struct | None:
         if metadata is None:
             return None
-        return struct_pb2.Struct(
-            # TODO: Add support for other types.
-            fields={
-                key: struct_pb2.Value(string_value=value)
-                for key, value in metadata.items()
-                if isinstance(value, str)
-            }
-        )
+        return dict_to_struct(metadata)
 
     @classmethod
     def part(cls, part: types.Part) -> a2a_pb2.Part:
@@ -80,8 +73,14 @@ class ToProto:
         cls, file: types.FileWithUri | types.FileWithBytes
     ) -> a2a_pb2.FilePart:
         if isinstance(file, types.FileWithUri):
-            return a2a_pb2.FilePart(file_with_uri=file.uri)
-        return a2a_pb2.FilePart(file_with_bytes=file.bytes.encode('utf-8'))
+            return a2a_pb2.FilePart(
+                file_with_uri=file.uri, mime_type=file.mime_type, name=file.name
+            )
+        return a2a_pb2.FilePart(
+            file_with_bytes=file.bytes.encode('utf-8'),
+            mime_type=file.mime_type,
+            name=file.name,
+        )
 
     @classmethod
     def task(cls, task: types.Task) -> a2a_pb2.Task:
@@ -123,6 +122,8 @@ class ToProto:
                 return a2a_pb2.TaskState.TASK_STATE_FAILED
             case types.TaskState.input_required:
                 return a2a_pb2.TaskState.TASK_STATE_INPUT_REQUIRED
+            case types.TaskState.auth_required:
+                return a2a_pb2.TaskState.TASK_STATE_AUTH_REQUIRED
             case _:
                 return a2a_pb2.TaskState.TASK_STATE_UNSPECIFIED
 
@@ -318,6 +319,23 @@ class ToProto:
         return a2a_pb2.AgentCapabilities(
             streaming=bool(capabilities.streaming),
             push_notifications=bool(capabilities.push_notifications),
+            extensions=[
+                cls.extension(x) for x in capabilities.extensions or []
+            ],
+        )
+
+    @classmethod
+    def extension(
+        cls,
+        extension: types.AgentExtension,
+    ) -> a2a_pb2.AgentExtension:
+        return a2a_pb2.AgentExtension(
+            uri=extension.uri,
+            description=extension.description,
+            params=dict_to_struct(extension.params)
+            if extension.params
+            else None,
+            required=extension.required,
         )
 
     @classmethod
@@ -338,16 +356,12 @@ class ToProto:
     ) -> list[a2a_pb2.Security] | None:
         if not security:
             return None
-        rval: list[a2a_pb2.Security] = []
-        for s in security:
-            rval.append(
-                a2a_pb2.Security(
-                    schemes={
-                        k: a2a_pb2.StringList(list=v) for (k, v) in s.items()
-                    }
-                )
+        return [
+            a2a_pb2.Security(
+                schemes={k: a2a_pb2.StringList(list=v) for (k, v) in s.items()}
             )
-        return rval
+            for s in security
+        ]
 
     @classmethod
     def security_schemes(
@@ -475,11 +489,9 @@ class FromProto:
 
     @classmethod
     def metadata(cls, metadata: struct_pb2.Struct) -> dict[str, Any]:
-        return {
-            key: value.string_value
-            for key, value in metadata.fields.items()
-            if value.string_value
-        }
+        if not metadata.fields:
+            return {}
+        return json_format.MessageToDict(metadata)
 
     @classmethod
     def part(cls, part: a2a_pb2.Part) -> types.Part:
@@ -504,9 +516,19 @@ class FromProto:
     def file(
         cls, file: a2a_pb2.FilePart
     ) -> types.FileWithUri | types.FileWithBytes:
+        common_args = {
+            'mime_type': file.mime_type or None,
+            'name': file.name or None,
+        }
         if file.HasField('file_with_uri'):
-            return types.FileWithUri(uri=file.file_with_uri)
-        return types.FileWithBytes(bytes=file.file_with_bytes.decode('utf-8'))
+            return types.FileWithUri(
+                uri=file.file_with_uri,
+                **common_args,
+            )
+        return types.FileWithBytes(
+            bytes=file.file_with_bytes.decode('utf-8'),
+            **common_args,
+        )
 
     @classmethod
     def task_or_message(
@@ -548,6 +570,8 @@ class FromProto:
                 return types.TaskState.failed
             case a2a_pb2.TaskState.TASK_STATE_INPUT_REQUIRED:
                 return types.TaskState.input_required
+            case a2a_pb2.TaskState.TASK_STATE_AUTH_REQUIRED:
+                return types.TaskState.auth_required
             case _:
                 return types.TaskState.unknown
 
@@ -765,6 +789,21 @@ class FromProto:
         return types.AgentCapabilities(
             streaming=capabilities.streaming,
             push_notifications=capabilities.push_notifications,
+            extensions=[
+                cls.agent_extension(x) for x in capabilities.extensions
+            ],
+        )
+
+    @classmethod
+    def agent_extension(
+        cls,
+        extension: a2a_pb2.AgentExtension,
+    ) -> types.AgentExtension:
+        return types.AgentExtension(
+            uri=extension.uri,
+            description=extension.description,
+            params=json_format.MessageToDict(extension.params),
+            required=extension.required,
         )
 
     @classmethod
@@ -774,10 +813,9 @@ class FromProto:
     ) -> list[dict[str, list[str]]] | None:
         if not security:
             return None
-        rval: list[dict[str, list[str]]] = []
-        for s in security:
-            rval.append({k: list(v.list) for (k, v) in s.schemes.items()})
-        return rval
+        return [
+            {k: list(v.list) for (k, v) in s.schemes.items()} for s in security
+        ]
 
     @classmethod
     def provider(
@@ -905,3 +943,25 @@ class FromProto:
                 return types.Role.agent
             case _:
                 return types.Role.agent
+
+
+def dict_to_struct(dictionary: dict[str, Any]) -> struct_pb2.Struct:
+    """Converts a Python dict to a Struct proto.
+
+    Unfortunately, using `json_format.ParseDict` does not work because this
+    wants the dictionary to be an exact match of the Struct proto with fields
+    and keys and values, not the traditional Python dict structure.
+
+    Args:
+      dictionary: The Python dict to convert.
+
+    Returns:
+      The Struct proto.
+    """
+    struct = struct_pb2.Struct()
+    for key, val in dictionary.items():
+        if isinstance(val, dict):
+            struct[key] = dict_to_struct(val)
+        else:
+            struct[key] = val
+    return struct
